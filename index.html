@@ -1,62 +1,110 @@
-<!DOCTYPE html>
-<html>
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const { pool } = require('./db');
+require('dotenv').config();
 
-<head>
-    <title>Voucher generator</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
-    <script defer src="index.js"></script>
-</head>
+// Auto start Telegram Bot
+try {
+    require('./telegramBot');
+    console.log('🤖 Telegram Bot Worker attached and active!');
+} catch (err) {
+    console.error('❌ Bot startup error:', err.message);
+}
 
-<body>
-    <h1>Voucher generator</h1>
-    <div id="content"></div>
-    <form id="voucherForm" hidden>
-        <fieldset>
-            <legend>Select vouchers to generate</legend>
-            <table id="products">
-                <thead>
-                    <tr>
-                        <th>Amount</th>
-                        <th>Name</th>
-                        <th>ID</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr>
-                        <td><input type="number" id="amount-6" min="0" value="0"></td>
-                        <td>Single filter</td>
-                        <td>6</td>
-                    </tr>
-                    <tr>
-                        <td><input type="number" id="amount-15" min="0" value="0"></td>
-                        <td>Single fancy</td>
-                        <td>15</td>
-                    </tr>
-                    <tr>
-                        <td><input type="number" id="amount-7" min="0" value="0"></td>
-                        <td>10 filter</td>
-                        <td>7</td>
-                    </tr>
-                    <tr>
-                        <td><input type="number" id="amount-14" min="0" value="0"></td>
-                        <td>10 fancy</td>
-                        <td>14</td>
-                    </tr>
-                </tbody>
-            </table>
-        </fieldset>
-        <fieldset>
-            <legend>Additional details (required)</legend>
-            <label for="voucherPrefix">Voucher Prefix (3 letters):</label>
-            <input type="text" id="voucherPrefix" minlength="3" maxlength="3" required>
-            <label for="description">Description:</label>
-            <input type="text" id="description" required>
-            <label for="requester">Requester:</label>
-            <input type="text" id="requester" required>
-        </fieldset>
-        <input type="submit" value="Generate!">
-    </form>
-    <div id="issuedVouchers"></div>
-</body>
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
-</html>
+// REGISTER HANDLER
+const handleRegister = async (req, res) => {
+    try {
+        const { email, password, full_name, name } = req.body;
+        const userEmail = email ? email.trim().toLowerCase() : null;
+        const userName = full_name || name || 'Customer';
+        
+        if (!userEmail || !password) {
+            return res.status(400).json({ error: 'Email and password required' });
+        }
+        
+        const existing = await pool.query('SELECT id FROM users WHERE email = $1', [userEmail]);
+        if (existing.rows.length > 0) {
+            return res.status(400).json({ error: 'Email already registered' });
+        }
+
+        const newUser = await pool.query(
+            'INSERT INTO users (email, password_hash, full_name) VALUES ($1, $2, $3) RETURNING id, email, full_name',
+            [userEmail, password, userName]
+        );
+        res.json({ success: true, user: newUser.rows[0] });
+    } catch (err) {
+        console.error('Register DB Error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+};
+
+app.post('/api/auth/register', handleRegister);
+app.post('/api/register', handleRegister);
+app.post('/api/users/register', handleRegister);
+
+// LOGIN HANDLER
+const handleLogin = async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        const userEmail = email ? email.trim().toLowerCase() : null;
+        const result = await pool.query('SELECT * FROM users WHERE email = $1', [userEmail]);
+        
+        if (result.rows.length === 0 || result.rows[0].password_hash !== password) {
+            return res.status(401).json({ error: 'Invalid email or password' });
+        }
+        const user = result.rows[0];
+        res.json({ success: true, user: { id: user.id, email: user.email, full_name: user.full_name } });
+    } catch (err) {
+        console.error('Login DB Error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+};
+
+app.post('/api/auth/login', handleLogin);
+app.post('/api/login', handleLogin);
+
+// STORE BRANDS & PRODUCTS
+const getStoreData = async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT b.id, b.name, b.logo_url, c.id as category_id, c.name as category_name,
+                   COALESCE(json_agg(
+                       json_build_object(
+                           'id', p.id,
+                           'title', p.title,
+                           'denomination', p.denomination,
+                           'selling_price', p.selling_price,
+                           'stock', (SELECT count(*) FROM voucher_inventory vi WHERE vi.voucher_product_id = p.id AND vi.status = 'AVAILABLE')
+                       )
+                   ) FILTER (WHERE p.id IS NOT NULL), '[]') as products
+            FROM brands b
+            LEFT JOIN categories c ON b.category_id = c.id
+            LEFT JOIN voucher_products p ON b.id = p.brand_id
+            GROUP BY b.id, b.name, b.logo_url, c.id, c.name
+        `);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Store DB Error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+};
+
+app.get('/api/store/brands', getStoreData);
+app.get('/api/brands', getStoreData);
+app.get('/api/products', getStoreData);
+
+// SPA Fallback
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log('🚀 Server is running on port ' + PORT);
+});
